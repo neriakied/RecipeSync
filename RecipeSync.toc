@@ -2,7 +2,7 @@
 ## Title: RecipeSync
 ## Notes: Your guild's professions in the default trade skill window. Shares who can craft what, across guilds too. Type /recipes
 ## Author: You
-## Version: 1.0.0
+## Version: 1.0.1
 ## SavedVariables: RecipeSyncDB
 Data.lua
 Core.lua

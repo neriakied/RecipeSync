@@ -17,7 +17,7 @@
 RecipeSync = {}
 local RS = RecipeSync
 
-RS.VERSION  = "1.0.0"
+RS.VERSION  = "1.0.1"
 RS.PREFIX   = "RcSync"
 RS.PROTO    = "3"
 RS.CHANTAG  = "RcS:"     -- marks our lines in the hidden sync channel

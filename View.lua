@@ -455,7 +455,7 @@ function V:CreateWidgets()
   -- search box where the inventory-slot dropdown normally is
   local eb = CreateFrame("EditBox", "RecipeSyncViewSearch", TradeSkillFrame, "InputBoxTemplate")
   eb:SetWidth(108); eb:SetHeight(20)
-  eb:SetPoint("LEFT", TradeSkillInvSlotDropDown, "LEFT", 30, 2)
+  eb:SetPoint("TOPRIGHT", TradeSkillFrame, "TOPRIGHT", -44, -72) -- fixed spot, top right
   eb:SetAutoFocus(false)
   eb:SetMaxLetters(40)
   eb:Hide()
@@ -532,6 +532,41 @@ function V:CreateWidgets()
   self.btnAdd, self.btnRemove = add, rem
 end
 
+-- Some clients add their own search box to the trade skill window. It filters the real list (not ours)
+-- and sits on top of our checkboxes, so hide any edit box we didn't create while the guild view is up.
+local OURS = { RecipeSyncViewSearch = true, TradeSkillInputBox = true }
+V.hiddenForeign = {}
+
+local function HideForeign(parent, depth)
+  if not parent or depth > 2 or not parent.GetChildren then return end
+  local kids = { parent:GetChildren() }
+  for i = 1, getn(kids) do
+    local k = kids[i]
+    local ok, t = pcall(k.GetObjectType, k)
+    local name = k.GetName and k:GetName()
+    if ok and t == "EditBox" and not OURS[name or ""] then
+      if k:IsShown() then
+        k:Hide()
+        tinsert(V.hiddenForeign, k)
+      end
+    elseif ok and t == "Frame" then
+      HideForeign(k, depth + 1)
+    end
+  end
+end
+
+function V:HideForeignSearch()
+  if TradeSkillFrame then HideForeign(TradeSkillFrame, 1) end
+end
+
+function V:RestoreForeignSearch()
+  for i = 1, getn(self.hiddenForeign) do
+    local k = self.hiddenForeign[i]
+    if k and k.Show then k:Show() end
+  end
+  self.hiddenForeign = {}
+end
+
 local CRAFT_CONTROLS = {
   "TradeSkillCreateButton", "TradeSkillCreateAllButton", "TradeSkillDecrementButton",
   "TradeSkillInputBox", "TradeSkillIncrementButton",
@@ -551,6 +586,7 @@ function V:Decorate()
   end
   TradeSkillInvSlotDropDown:Hide()
   if getn(self.headers or {}) < 2 then TradeSkillSubClassDropDown:Hide() end
+  RS:Safe(V.HideForeignSearch, V)
   if not self.searchBox:IsShown() then self.searchBox:Show() end
   self.cbUnconf:Show(); self.cbUnconf:SetChecked(Settings().showUnconfirmed)
   self.cbKnown:Show(); self.cbKnown:SetChecked(Settings().knownOnly)
@@ -755,6 +791,7 @@ function V:Deactivate()
   RS:Safe(V.Decorate, V)
   if self.origChildHeight then TradeSkillDetailScrollChildFrame:SetHeight(self.origChildHeight) end
   if TradeSkillReagentLabel then TradeSkillReagentLabel:Show() end
+  RS:Safe(V.RestoreForeignSearch, V)
   for i = 1, getn(CRAFT_CONTROLS) do
     local w = getglobal(CRAFT_CONTROLS[i])
     if w then w:Show() end
