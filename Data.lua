@@ -2,6 +2,7 @@
 -- Item names/icons/created items matched against the Turtle WoW server data (Penqle/tortoise-wow).
 RecipeSyncData = {}
 RecipeSyncData.source = "octowow.st/db 2026-11-24"
+RecipeSyncData.id = "o1"  -- bump when the recipe order changes; lists are sent as positions in this data
 RecipeSyncData.profs = {
 {name="Alchemy",icon="Trade_Alchemy",headers={"Cauldrons","Elixirs","Flasks","Oils","Potions","Transmutes","Other"},r={
 {47000,"Cauldron of Major Arcane Protection","inv_misc_cauldron_arcane",25901,1,1,315,330,1,{13461,20,20725,2,16203,1},nil},

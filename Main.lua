@@ -249,9 +249,7 @@ end
 function M:SyncNow()
   if IsInGuild() then GuildRoster() end
   if not RS.chanId then RS:UpdateChannel() end
-  RS:Announce()
-  local d = RS:Dists()
-  for i = 1, table.getn(d) do RS:RequestDirectory(d[i]) end
+  RS:Announce() -- also asks for the directory if ours is out of date
   -- fetch missing/outdated lists; offline crafters' lists are passed along by whoever has a copy
   local n = 0
   for name, pl in pairs(RS.players) do
@@ -292,6 +290,7 @@ local HELP = {
   "/recipes sync - announce yourself and fetch anything missing",
   "/recipes guild <name> - sync with another guild (empty = your own guild)",
   "/recipes export - open the spreadsheet export",
+  "/recipes minimap - show/hide the minimap button",
   "/recipes auto on|off - download lists automatically when they change (now: %s)",
   "/recipes unsafe on|off - tooltips for items not in your cache (now: %s)",
   "/recipes forget <player> - delete a player's saved recipes",
@@ -316,6 +315,10 @@ SlashCmdList["RECIPESYNC"] = function(msg)
   elseif cmd == "guild" then
     RS:SetSyncGroup(rest)
     M:UpdateGuildBox()
+  elseif cmd == "minimap" then
+    s.minimap = not s.minimap
+    RS.MinimapButton:Update()
+    RS:Print("Minimap button " .. (s.minimap and "shown" or "hidden") .. ".")
   elseif cmd == "export" then
     RS.Export:Show()
   elseif cmd == "auto" then

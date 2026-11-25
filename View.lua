@@ -455,7 +455,7 @@ function V:CreateWidgets()
   -- search box where the inventory-slot dropdown normally is
   local eb = CreateFrame("EditBox", "RecipeSyncViewSearch", TradeSkillFrame, "InputBoxTemplate")
   eb:SetWidth(108); eb:SetHeight(20)
-  eb:SetPoint("TOPRIGHT", TradeSkillFrame, "TOPRIGHT", -44, -72) -- fixed spot, top right
+  eb:SetPoint("LEFT", TradeSkillInvSlotDropDown, "LEFT", 30, 2) -- right next to the category dropdown
   eb:SetAutoFocus(false)
   eb:SetMaxLetters(40)
   eb:Hide()
@@ -518,7 +518,7 @@ function V:CreateWidgets()
   add:SetScript("OnEnter", function()
     GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
     GameTooltip:SetText("Add Name", 1, 1, 1)
-    GameTooltip:AddLine("Add a player who knows this recipe but doesn't use RecipeSync. Shared with everyone as unconfirmed.", nil, nil, nil, 1)
+    GameTooltip:AddLine("Add a player who knows this recipe but doesn't use RecipeSync. Shared with your guild as unconfirmed. Only the top 3 guild ranks can do this.", nil, nil, nil, 1)
     GameTooltip:Show()
   end)
   add:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -642,9 +642,13 @@ function V:UpdateDetail()
     for i = 1, getn(list) do if not list[i].ok then hidden = hidden + 1 end end
     if hidden > 0 then txt = txt .. " |cff888888(+" .. hidden .. " unconfirmed hidden)|r" end
   end
+  local canEdit = RS:CanEditNames()
+  if e.r and not canEdit then
+    txt = txt .. "\n|cff888888Only the top 3 guild ranks can add or remove names.|r"
+  end
   self.cText:SetText(txt)
   self.cLabel:Show(); self.cText:Show()
-  if e.r then self.btnAdd:Show(); self.btnRemove:Show() else self.btnAdd:Hide(); self.btnRemove:Hide() end
+  if e.r and canEdit then self.btnAdd:Show(); self.btnRemove:Show() else self.btnAdd:Hide(); self.btnRemove:Hide() end
 
   -- make the detail pane scroll far enough to show everything
   local rows = math.floor((n + 1) / 2)
@@ -686,7 +690,7 @@ StaticPopupDialogs["RECIPESYNC_REMOVE_NAME"] = {
 
 function V:AskName(remove)
   local e = self.sel
-  if not e or not e.r then return end
+  if not e or not e.r or not RS:CanEditNames() then return end
   local dlg = StaticPopup_Show(remove and "RECIPESYNC_REMOVE_NAME" or "RECIPESYNC_ADD_NAME", e.r.name)
   if dlg then dlg.data = { prof = self.prof, spell = e.r.spell, remove = remove } end
 end

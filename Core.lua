@@ -17,30 +17,33 @@
 RecipeSync = {}
 local RS = RecipeSync
 
-RS.VERSION  = "1.0.1"
+RS.VERSION  = "1.1.0"
 RS.PREFIX   = "RcSync"
-RS.PROTO    = "3"
+RS.PROTO    = "4"        -- bump when messages change; older protocols are ignored (except for update notices)
+RS.PROTO_NUM = 4
 RS.CHANTAG  = "RcS:"     -- marks our lines in the hidden sync channel
-RS.CPS      = 700        -- bytes/second we allow ourselves to send
-RS.BURST    = 1500
-RS.OVERHEAD = 40
-RS.CHUNK    = 200
-RS.CHANNEL_GAP = 1.1     -- seconds between lines in the chat channel (stay well under any spam limit)
+RS.GITHUB   = ""         -- e.g. "github.com/YourName/RecipeSync"; shown in the update notice when set
+RS.OFFICER_RANK = 2      -- guild ranks 0-2 (Guild Master + the next two ranks) may add/remove names
+RS.MSG_RATE  = 1.0       -- we send at most 1 message per second on average...
+RS.MSG_BURST = 3         -- ...with short bursts of up to 3
+RS.CHANNEL_GAP = 1.2     -- and never faster than this in the chat channel
+RS.CHUNK    = 225
 RS.STALE    = 15 * 86400 -- players not seen for 15 days are removed
 
 RS.LIMIT = {
-  msgsPer10s     = 120,   -- per sender, before they are ignored for 'mute' seconds
-  mute           = 120,
-  chunksPerXfer  = 140,
+  msgsPer10s     = 60,    -- per sender, before they are ignored for 'mute' seconds
+  mute           = 300,
+  chunksPerXfer  = 60,
   inbound        = 16,
-  bulkQueue      = 500,
+  bulkQueue      = 300,
   idsPerList     = 1500,
   manualTotal    = 5000,
   manualPerMin   = 40,
-  autoRequests   = 25,    -- automatic downloads per 5 minutes
-  syncNowRequests = 40,   -- requests per "Sync Now" click
+  autoRequests   = 60,    -- lists requested automatically per 5 minutes
+  syncNowRequests = 60,   -- lists requested per "Sync Now" click
   indexEntries   = 12,
   dirEntries     = 600,
+  reqPerMsg      = 12,    -- lists asked for in one request message
 }
 
 local getn, tinsert, tremove, tsort, tconcat = table.getn, table.insert, table.remove, table.sort, table.concat
@@ -104,7 +107,7 @@ local function San(s)
 end
 RS.San = San
 
--- ids are sent as plain digits (letters could be mangled by the chat profanity filter)
+-- numbers are sent as plain digits (letters could be mangled by the chat profanity filter)
 local function ParseId(s)
   if not s or s == "" or strlen(s) > 7 or strfind(s, "[^0-9]") then return nil end
   return tonumber(s)
@@ -186,10 +189,14 @@ function RS:MyName() return UnitName("player") end
 function RS:InitDB()
   if type(RecipeSyncDB) ~= "table" then RecipeSyncDB = {} end
   local db = RecipeSyncDB
-  if db.schema ~= 3 then
-    db.realms = nil -- earlier test builds stored data differently; start clean
-    db.schema = 3
+  if db.schema ~= 3 and db.schema ~= 4 then
+    db.realms = nil -- early test builds stored data differently; start clean
   end
+  if db.schema == 3 then
+    -- 1.0.x: keep recipe lists, but drop every hand-added name (they weren't rank-checked)
+    for _, r in pairs(db.realms or {}) do r.manual = {} end
+  end
+  db.schema = 4
   db.settings = db.settings or {}
   local s = db.settings
   if s.autoFetch == nil then s.autoFetch = true end
@@ -198,6 +205,8 @@ function RS:InitDB()
   if s.knownOnly == nil then s.knownOnly = false end
   if s.exportTabs == nil then s.exportTabs = true end
   if type(s.syncGuild) ~= "string" then s.syncGuild = "" end
+  if s.minimap == nil then s.minimap = true end
+  if type(s.minimapAngle) ~= "number" then s.minimapAngle = 215 end
   db.realms = db.realms or {}
   self.realm = GetRealmName() or "Unknown"
   local r = db.realms[self.realm]
@@ -391,28 +400,129 @@ function RS:ColorName(name)
 end
 
 -------------------------------------------------------------------------------
--- Known recipe lists:  "3~<spell ids, comma separated>~<names not in the database, ` separated>"
+-- Known recipe lists
+--   "4~<data id>~<bitmap>~<names not in the database, ` separated>"
+--   The bitmap has one bit per recipe of the profession (in Data.lua order), written as hex digits,
+--   with long runs of zeros shortened to "-<count>-". A maxed profession fits in one message.
+--   Lists saved by 1.0.x ("3~<ids>~<names>") are still read.
 -------------------------------------------------------------------------------
-RS.knownCache = {}
-function RS:ParseKnown(data, hash)
-  local key = hash or data
-  local c = self.knownCache[key]
-  if c then return c end
-  local parts = Split(data, "~", 3)
-  if parts[1] ~= "3" then return nil end
-  self.knownCacheN = (self.knownCacheN or 0) + 1
-  if self.knownCacheN > 400 then self.knownCache = {}; self.knownCacheN = 1 end
-  c = { ids = {}, extras = {}, n = 0 }
-  if parts[2] and parts[2] ~= "" then
-    local ids = Split(parts[2], ",")
-    for i = 1, getn(ids) do
-      if i > self.LIMIT.idsPerList then break end
-      local id = ParseId(ids[i])
-      if id then c.ids[id] = true; c.n = c.n + 1 end
+local HEX = "0123456789abcdef"
+local BIT = { [0] = 8, [1] = 4, [2] = 2, [3] = 1 }
+
+function RS:EncodeBits(sp, set)
+  local n = getn(sp.recipes)
+  local digits = {}
+  for i = 1, n, 4 do
+    local v = 0
+    for k = 0, 3 do
+      local r = sp.recipes[i + k]
+      v = v * 2
+      if r and set[r.spell] then v = v + 1 end
+    end
+    tinsert(digits, strsub(HEX, v + 1, v + 1))
+  end
+  local last = getn(digits)
+  while last > 0 and digits[last] == "0" do last = last - 1 end
+  local out, i = {}, 1
+  while i <= last do
+    if digits[i] == "0" then
+      local j = i
+      while j + 1 <= last and digits[j + 1] == "0" do j = j + 1 end
+      local run = j - i + 1
+      if run >= 4 then
+        tinsert(out, "-" .. run .. "-")
+      else
+        for _ = 1, run do tinsert(out, "0") end
+      end
+      i = j + 1
+    else
+      tinsert(out, digits[i])
+      i = i + 1
     end
   end
-  if parts[3] and parts[3] ~= "" then
-    local ex = Split(parts[3], "`")
+  return tconcat(out)
+end
+
+-- returns set of spell ids, or nil if the text is malformed
+function RS:DecodeBits(sp, s)
+  local maxDigits = math.ceil(getn(sp.recipes) / 4)
+  local digits, pos, len = {}, 1, strlen(s)
+  while pos <= len do
+    local c = strsub(s, pos, pos)
+    if c == "-" then
+      local close = strfind(s, "-", pos + 1, true)
+      if not close then return nil end
+      local run = ParseId(strsub(s, pos + 1, close - 1))
+      if not run or getn(digits) + run > maxDigits then return nil end
+      for _ = 1, run do tinsert(digits, 0) end
+      pos = close + 1
+    else
+      local v = tonumber(c, 16)
+      if not v or getn(digits) >= maxDigits then return nil end
+      tinsert(digits, v)
+      pos = pos + 1
+    end
+  end
+  local set = {}
+  for d = 1, getn(digits) do
+    local v = digits[d]
+    if v > 0 then
+      for k = 0, 3 do
+        if mod(floor(v / BIT[k]), 2) == 1 then
+          local r = sp.recipes[(d - 1) * 4 + k + 1]
+          if r then set[r.spell] = true end
+        end
+      end
+    end
+  end
+  return set
+end
+
+function RS:BuildPayload(sp, set, extras)
+  return "4~" .. ((RecipeSyncData and RecipeSyncData.id) or "?") .. "~" .. self:EncodeBits(sp, set) .. "~" .. tconcat(extras, "`")
+end
+
+RS.knownCache = {}
+function RS:ParseKnown(data, hash, prof)
+  if type(data) ~= "string" then return nil end
+  local key = (hash or data) .. "/" .. (prof or "")
+  local c = self.knownCache[key]
+  if c then return c end
+  local parts = Split(data, "~", 4)
+  local ids, extrasText
+  if parts[1] == "4" then
+    local sp = prof and self:Static(prof)
+    if parts[2] ~= RecipeSyncData.id then return nil end -- made with a different recipe database
+    if sp then
+      ids = self:DecodeBits(sp, parts[3] or "")
+      if not ids then return nil end
+    elseif parts[3] ~= "" then
+      return nil
+    else
+      ids = {}
+    end
+    extrasText = parts[4]
+  elseif parts[1] == "3" then
+    parts = Split(data, "~", 3)
+    ids = {}
+    if parts[2] and parts[2] ~= "" then
+      local list = Split(parts[2], ",")
+      for i = 1, getn(list) do
+        if i > self.LIMIT.idsPerList then break end
+        local id = ParseId(list[i])
+        if id then ids[id] = true end
+      end
+    end
+    extrasText = parts[3]
+  else
+    return nil
+  end
+  self.knownCacheN = (self.knownCacheN or 0) + 1
+  if self.knownCacheN > 400 then self.knownCache = {}; self.knownCacheN = 1 end
+  c = { ids = ids, extras = {}, n = 0 }
+  for _ in pairs(ids) do c.n = c.n + 1 end
+  if extrasText and extrasText ~= "" then
+    local ex = Split(extrasText, "`")
     for i = 1, getn(ex) do
       if i > 200 then break end
       if ex[i] ~= "" and strlen(ex[i]) <= 80 then tinsert(c.extras, ex[i]); c.n = c.n + 1 end
@@ -443,7 +553,7 @@ function RS:Crafters(prof)
   for name, pl in pairs(self.players or {}) do
     local p = pl.profs[prof]
     if p and p.data and self:Fresh(name) then
-      local k = self:ParseKnown(p.data, p.hash)
+      local k = self:ParseKnown(p.data, p.hash, prof)
       if k then
         c.people = c.people + 1
         for spell in pairs(k.ids) do AddCrafter(c.bySpell, spell, name, true) end
@@ -485,7 +595,7 @@ function RS:Serialize(api)
   local n = api.num() or 0
   if n == 0 or n > 1000 then return nil end
   local sp = self:Static(prof)
-  local ids, extras, count = {}, {}, 0
+  local set, extras, count = {}, {}, 0
   local seen = {}
   for i = 1, n do
     local name, stype = api.info(i)
@@ -509,11 +619,7 @@ function RS:Serialize(api)
       end
       if sp and not rec then rec = sp.byName[strlower(name)] end
       if rec then
-        if not seen[rec.spell] then
-          seen[rec.spell] = true
-          tinsert(ids, rec.spell)
-          count = count + 1
-        end
+        if not set[rec.spell] then set[rec.spell] = true; count = count + 1 end
       else
         local clean = San(name)
         if clean ~= "" and not seen[clean] then
@@ -524,9 +630,13 @@ function RS:Serialize(api)
       end
     end
   end
-  tsort(ids)
   tsort(extras)
-  local payload = "3~" .. tconcat(ids, ",") .. "~" .. tconcat(extras, "`")
+  local payload
+  if sp then
+    payload = self:BuildPayload(sp, set, extras)
+  else
+    payload = "4~" .. ((RecipeSyncData and RecipeSyncData.id) or "?") .. "~~" .. tconcat(extras, "`")
+  end
   return prof, rank or 0, maxRank or 0, payload, count
 end
 
@@ -613,6 +723,25 @@ function RS:PruneOwn()
 end
 
 -------------------------------------------------------------------------------
+-- Guild ranks: only the top ranks (Guild Master, Officer, Dragon = rank 0-2) may add or remove names
+-------------------------------------------------------------------------------
+RS.rosterRank = {}
+
+function RS:IsOfficer(name)
+  if not IsInGuild() then return false end
+  if name == self:MyName() then
+    local _, _, idx = GetGuildInfo("player")
+    return idx ~= nil and idx <= self.OFFICER_RANK
+  end
+  local idx = self.rosterRank[name]
+  return idx ~= nil and idx <= self.OFFICER_RANK
+end
+
+function RS:CanEditNames()
+  return self:IsOfficer(self:MyName())
+end
+
+-------------------------------------------------------------------------------
 -- Unconfirmed (hand-entered) crafters
 --   manual[key] = { c = crafter, p = prof, s = spell, b = added/removed by, t = time, d = deleted }
 -------------------------------------------------------------------------------
@@ -649,6 +778,7 @@ function RS:MergeManual(c, prof, spell, t, d, by)
   if not sp or not sp.bySpell[spell] then return false end
   t = tonumber(t)
   if not t or t < 1000000000 or t > time() + 86400 then return false end
+  t = floor(t)
   local key = c .. "/" .. spell
   local old = self.manual[key]
   if old and (old.t > t or (old.t == t and (old.d or not d))) then return false end
@@ -658,16 +788,20 @@ function RS:MergeManual(c, prof, spell, t, d, by)
 end
 
 function RS:SetManual(crafter, prof, spell, deleted)
+  if not self:CanEditNames() then
+    self:Print("Only the top 3 guild ranks can add or remove names.")
+    return false
+  end
   crafter = self:CapName(crafter)
   if not self:ValidName(crafter) then
     self:Print("'" .. tostring(crafter) .. "' doesn't look like a character name.")
     return false
   end
-  local t = time()
+  local t = floor(time())
   local old = self.manual[crafter .. "/" .. spell]
   if old and old.t >= t then t = old.t + 1 end
   if not self:MergeManual(crafter, prof, spell, t, deleted, self:MyName()) then return false end
-  self:Broadcast("M^" .. crafter .. "^" .. prof .. "^" .. spell .. "^" .. t .. "^" .. (deleted and 1 or 0) .. "^" .. self:MyName())
+  self:Broadcast("M^" .. self.PROTO .. "^" .. crafter .. "^" .. prof .. "^" .. spell .. "^" .. t .. "^" .. (deleted and 1 or 0) .. "^" .. self:MyName())
   self:Changed()
   return true
 end
@@ -684,7 +818,7 @@ function RS:DirEntries()
         local h = p.latest or p.hash
         if h then
           tinsert(out, name .. "," .. (pl.class or "") .. "," .. prof .. "," .. (p.rank or 0) .. "," .. (p.max or 0)
-            .. "," .. (p.count or 0) .. "," .. h .. "," .. (pl.seen or time()))
+            .. "," .. (p.count or 0) .. "," .. h .. "," .. floor(pl.seen or time()))
         end
       end
     end
@@ -699,33 +833,15 @@ function RS:DirDigest()
   local keys = {}
   for name, pl in pairs(self.players) do
     if self:Fresh(name) then
-      for prof, p in pairs(pl.profs) do tinsert(keys, name .. ":" .. prof .. ":" .. (p.latest or p.hash or "")) end
+      for prof, p in pairs(pl.profs) do
+        local h = p.latest or p.hash
+        if h then tinsert(keys, name .. ":" .. prof .. ":" .. h) end
+      end
     end
   end
   tsort(keys)
   self.dd, self.ddRev = self:Hash(tconcat(keys, ";")), self.rev
   return self.dd
-end
-
-function RS:RequestDirectory(dist)
-  if not dist then return end
-  self:Send("D^" .. self:DirDigest(), dist)
-end
-
-function RS:SendDirectory(dist)
-  local key = "dir/" .. dist
-  local last = self.lastDump[key]
-  if last and GetTime() - last < 120 then return end
-  if getn(self.bulkQ) > self.LIMIT.bulkQueue then return end
-  local entries = self:DirEntries()
-  if getn(entries) == 0 then return end
-  local chunks = self:Chunk(tconcat(entries, ";"), self.CHUNK)
-  if getn(chunks) > self.LIMIT.chunksPerXfer then return end
-  self.lastDump[key] = GetTime()
-  local digest = self:DirDigest()
-  self:Send("S^D^*^" .. digest .. "^" .. getn(chunks) .. "^" .. getn(entries), dist, true)
-  for i = 1, getn(chunks) do self:Send("C^" .. chunks[i] .. ".", dist, true) end
-  self:Send("E^D^*^" .. digest, dist, true)
 end
 
 function RS:MergeDirectory(data, dist)
@@ -749,7 +865,7 @@ function RS:MergeDirectory(data, dist)
         p.rank, p.max, p.count = tonumber(x[4]), tonumber(x[5]), tonumber(x[6])
       end
       if seen > (pl.seen or 0) then pl.seen = seen end
-      if p.hash ~= p.latest and self.db.settings.autoFetch then self:ScheduleAutoFetch(owner, prof) end
+      if p.hash ~= p.latest and self.db.settings.autoFetch then self:WantList(owner, prof, true) end
     end
   end
   if changed then self:Changed() end
@@ -797,8 +913,7 @@ function RS:PollChannel()
   if id and id > 0 then
     self.chanId = id
     self:HideChannel()
-    self:Announce("CHANNEL")
-    self:After("dirreq/CHANNEL", 5, function() RS:RequestDirectory("CHANNEL") end)
+    self:SendIndex("CHANNEL", true)
     if RS.Main and RS.Main.UpdateStatus then RS:Safe(RS.Main.UpdateStatus, RS.Main) end
     return
   end
@@ -810,7 +925,6 @@ function RS:PollChannel()
   end
 end
 
--- keep the channel out of every chat window
 function RS:HideChannel()
   if not self.chanName then return end
   for i = 1, (NUM_CHAT_WINDOWS or 7) do
@@ -826,12 +940,27 @@ function RS:ChannelId()
   self.chanId = nil
 end
 
+-- broadcasts go to the channel only when it's needed: we're syncing with another guild,
+-- or someone from outside our guild has been heard there in the last 30 minutes
+RS.outsiders = {}
+function RS:UseChannel()
+  if not self.chanId then return false end
+  local _, custom = self:SyncGroup()
+  if custom or not IsInGuild() then return true end
+  local now = GetTime()
+  for name, t in pairs(self.outsiders) do
+    if now - t < 1800 then return true end
+    self.outsiders[name] = nil
+  end
+  return false
+end
+
 function RS:SetSyncGroup(text)
   text = gsub(text or "", "^%s+", "")
   text = gsub(text, "%s+$", "")
   if strlen(text) > 40 then text = strsub(text, 1, 40) end
   local g = GetGuildInfo("player")
-  if g and strlower(text) == strlower(g) then text = "" end -- same as default
+  if g and strlower(text) == strlower(g) then text = "" end
   if text == self.db.settings.syncGuild then return end
   self.db.settings.syncGuild = text
   self:UpdateChannel()
@@ -843,13 +972,12 @@ function RS:SetSyncGroup(text)
   end
 end
 
--- swallow our channel's traffic before any chat window sees it
 do
   local orig = ChatFrame_OnEvent
   if orig then
     ChatFrame_OnEvent = function(e)
-      if RS.chanName and arg9 and type(e) == "string" and strsub(e, 1, 16) == "CHAT_MSG_CHANNEL"
-         and type(arg9) == "string" and strlower(arg9) == strlower(RS.chanName) then
+      if RS.chanName and type(arg9) == "string" and type(e) == "string" and strsub(e, 1, 16) == "CHAT_MSG_CHANNEL"
+         and strlower(arg9) == strlower(RS.chanName) then
         return
       end
       return orig(e)
@@ -858,13 +986,13 @@ do
 end
 
 -------------------------------------------------------------------------------
--- Communication
+-- Sending: one queue, paced to ~1 message/second (bursts of 3). Bulk data pauses in combat.
 -------------------------------------------------------------------------------
 RS.ctrlQ, RS.bulkQ = {}, {}
-RS.avail = RS.BURST
+RS.tokens = RS.MSG_BURST
 RS.inbound, RS.requested, RS.served, RS.live, RS.online = {}, {}, {}, {}, {}
 RS.lastDump, RS.rate, RS.muted, RS.manualRate, RS.seenXfer = {}, {}, {}, {}, {}
-RS.autoLog = {}
+RS.autoLog, RS.wanted = {}, {}
 RS.lastChannelSend = 0
 
 function RS:Send(msg, dist, bulk, onSent)
@@ -872,7 +1000,7 @@ function RS:Send(msg, dist, bulk, onSent)
   if dist == "GUILD" and not IsInGuild() then return end
   if dist == "CHANNEL" and not self.chanName then return end
   local q = bulk and self.bulkQ or self.ctrlQ
-  if getn(q) > 1000 then return end
+  if getn(q) > 600 then return end
   tinsert(q, { msg = msg, dist = dist, onSent = onSent })
 end
 
@@ -884,7 +1012,7 @@ end
 function RS:Dists()
   local t = {}
   if IsInGuild() then tinsert(t, "GUILD") end
-  if self.chanId then tinsert(t, "CHANNEL") end
+  if self:UseChannel() then tinsert(t, "CHANNEL") end
   local g = self:GroupDist()
   if g then tinsert(t, g) end
   return t
@@ -896,21 +1024,18 @@ function RS:Broadcast(msg)
 end
 
 function RS:PumpQueue(elapsed)
-  self.avail = self.avail + elapsed * self.CPS
-  if self.avail > self.BURST then self.avail = self.BURST end
-  local sent = 0
-  while sent < 10 do
+  self.tokens = self.tokens + elapsed / self.MSG_RATE
+  if self.tokens > self.MSG_BURST then self.tokens = self.MSG_BURST end
+  while self.tokens >= 1 do
     local q
     if self.ctrlQ[1] then q = self.ctrlQ
     elseif self.bulkQ[1] and not UnitAffectingCombat("player") then q = self.bulkQ end
     if not q then return end
     local m = q[1]
-    local cost = strlen(m.msg) + strlen(self.PREFIX) + self.OVERHEAD
-    if self.avail < cost then return end
     if m.dist == "CHANNEL" then
       if GetTime() - self.lastChannelSend < self.CHANNEL_GAP then return end
-      local id = self:ChannelId()
       tremove(q, 1)
+      local id = self:ChannelId()
       if id then
         self.lastChannelSend = GetTime()
         pcall(SendChatMessage, self.CHANTAG .. m.msg, "CHANNEL", nil, id)
@@ -919,8 +1044,7 @@ function RS:PumpQueue(elapsed)
       tremove(q, 1)
       pcall(SendAddonMessage, self.PREFIX, m.msg, m.dist)
     end
-    self.avail = self.avail - cost
-    sent = sent + 1
+    self.tokens = self.tokens - 1
     if m.onSent then self:Safe(m.onSent) end
   end
 end
@@ -930,7 +1054,8 @@ function RS:MyClass()
   return t or ""
 end
 
-function RS:BuildIndex()
+-- "I^4^version^class^prof:rank:max:count:hash;...^namesCount:namesDigest^directoryDigest^hello"
+function RS:BuildIndex(hello)
   local me = self:GetPlayer(self:MyName())
   local parts = {}
   if me then
@@ -943,7 +1068,8 @@ function RS:BuildIndex()
   tsort(parts)
   local md, mc = self:ManualDigest()
   local function build()
-    return "I^" .. self.PROTO .. "^" .. self.VERSION .. "^" .. self:MyClass() .. "^" .. tconcat(parts, ";") .. "^" .. mc .. ":" .. md
+    return "I^" .. self.PROTO .. "^" .. self.VERSION .. "^" .. self:MyClass() .. "^" .. tconcat(parts, ";")
+      .. "^" .. mc .. ":" .. md .. "^" .. self:DirDigest() .. "^" .. (hello and 1 or 0)
   end
   local s = build()
   while strlen(s) > 235 and getn(parts) > 0 do
@@ -953,12 +1079,18 @@ function RS:BuildIndex()
   return s
 end
 
+function RS:SendIndex(dist, hello)
+  self:Send(self:BuildIndex(hello), dist)
+end
+
 function RS:Announce(dist)
-  local hello = "H^" .. self.PROTO .. "^" .. self.VERSION .. "^" .. self:MyClass()
   if dist then
-    self:Send(hello, dist); self:Send(self:BuildIndex(), dist)
+    self:SendIndex(dist, true)
   else
-    self:Broadcast(hello); self:Broadcast(self:BuildIndex())
+    local d = self:Dists()
+    -- at login, also say hello in the channel so players from other guilds learn we're here
+    if self.chanId and not self:UseChannel() then tinsert(d, "CHANNEL") end
+    for i = 1, getn(d) do self:SendIndex(d[i], true) end
   end
   self.lastIndex = GetTime()
 end
@@ -971,33 +1103,87 @@ function RS:IndexChanged()
   end
   self:After("indexchanged", wait, function()
     RS.lastIndex = GetTime()
-    RS:Broadcast(RS:BuildIndex())
+    RS:Broadcast(RS:BuildIndex(false))
   end)
 end
 
-function RS:CheckVersion(v)
-  if v and not self.newerWarned and self:VersionNewer(v, self.VERSION) then
-    self.newerWarned = true
-    self:Print("Someone you sync with has a newer version (" .. v .. ").")
+-- tell the player once per version when someone runs a newer RecipeSync
+function RS:NoteVersion(proto, ver)
+  local p = tonumber(proto) or 0
+  local newer = p > self.PROTO_NUM or (p == self.PROTO_NUM and self:VersionNewer(ver, self.VERSION))
+  if not newer then return end
+  self.warned = self.warned or {}
+  local key = tostring(ver)
+  if self.warned[key] then return end
+  self.warned[key] = true
+  local where = (self.GITHUB ~= "" and ("from GitHub: |cffffd100" .. self.GITHUB .. "|r")) or "from its GitHub page"
+  local msg = "|cffff8000A newer RecipeSync (" .. key .. ") is out - you have " .. self.VERSION
+    .. ". Please update through your launcher or download it " .. where .. ".|r"
+  self:Print(msg)
+  if p > self.PROTO_NUM then
+    self:Print("|cffff8000Until you update, you can't sync with players on the newer version.|r")
   end
 end
 
-function RS:RequestProf(owner, prof, force)
-  local key = owner .. "/" .. prof
-  local last = self.requested[key]
-  if not force and last and GetTime() - last < 60 then return false end
+-------------------------------------------------------------------------------
+-- Asking for lists: requests are batched (up to 12 lists per message)
+-------------------------------------------------------------------------------
+function RS:ListDist(owner)
   local pl = self:GetPlayer(owner)
   local dist = pl and pl.dist
   if dist == "CHANNEL" and not self.chanId then dist = nil end
   if (dist == "PARTY" or dist == "RAID") and self:GroupDist() ~= dist then dist = nil end
-  dist = dist or (IsInGuild() and "GUILD") or (self.chanId and "CHANNEL") or self:GroupDist()
+  return dist or (IsInGuild() and "GUILD") or (self.chanId and "CHANNEL") or self:GroupDist()
+end
+
+-- auto: subject to the automatic-download limit
+function RS:WantList(owner, prof, auto, force)
+  local key = owner .. "/" .. prof
+  local last = self.requested[key]
+  if not force and last and GetTime() - last < 60 then return false end
+  if auto then
+    local now, n = GetTime(), 0
+    for i = getn(self.autoLog), 1, -1 do
+      if now - self.autoLog[i] > 300 then tremove(self.autoLog, i) else n = n + 1 end
+    end
+    if n >= self.LIMIT.autoRequests then return false end
+    tinsert(self.autoLog, now)
+  end
+  local dist = self:ListDist(owner)
   if not dist then return false end
   self.requested[key] = GetTime()
-  self:Send("Q^" .. owner .. "^" .. prof, dist)
+  self.wanted[dist] = self.wanted[dist] or {}
+  tinsert(self.wanted[dist], owner .. ":" .. prof)
+  -- wait a moment so several lists go out in one message
+  self:After("flushreq", auto and (3 + math.random() * 8) or 1, function() RS:FlushRequests() end)
   return true
 end
 
--- send owner's list (our own, or a copy we hold for someone who is offline)
+function RS:RequestProf(owner, prof, force)
+  return self:WantList(owner, prof, false, force)
+end
+
+function RS:FlushRequests()
+  for dist, list in pairs(self.wanted) do
+    local i = 1
+    while i <= getn(list) do
+      local batch = {}
+      local len = 0
+      while i <= getn(list) and getn(batch) < self.LIMIT.reqPerMsg and len + strlen(list[i]) < 220 do
+        tinsert(batch, list[i])
+        len = len + strlen(list[i]) + 1
+        i = i + 1
+      end
+      if getn(batch) == 0 then break end
+      self:Send("Q^" .. self.PROTO .. "^" .. tconcat(batch, ","), dist)
+    end
+  end
+  self.wanted = {}
+end
+
+-------------------------------------------------------------------------------
+-- Sending lists: one message ("L") for normal lists, chunks only when a list is unusually big
+-------------------------------------------------------------------------------
 function RS:ServeList(owner, prof, dist)
   local pl = self:GetPlayer(owner)
   local p = pl and pl.profs[prof]
@@ -1006,70 +1192,109 @@ function RS:ServeList(owner, prof, dist)
   local last = self.served[key]
   if last and GetTime() - last < 30 then return end
   if getn(self.bulkQ) > self.LIMIT.bulkQueue then return end
+  local meta = (p.rank or 0) .. ":" .. (p.max or 0) .. ":" .. (p.count or 0)
+  local seen = floor(pl.seen or time())
+  local single = "L^" .. self.PROTO .. "^" .. owner .. "^" .. prof .. "^" .. meta .. "^" .. seen .. "^" .. p.data
+  self.seenXfer[key] = GetTime()
+  if strlen(single) <= 240 then
+    self.served[key] = GetTime()
+    self:Send(single, dist, true)
+    return
+  end
   local chunks = self:Chunk(p.data, self.CHUNK)
   if getn(chunks) > self.LIMIT.chunksPerXfer then return end
   self.served[key] = GetTime() + 3600 -- in flight until the end marker is sent
-  self:Send("S^R^" .. prof .. "^" .. p.hash .. "^" .. getn(chunks) .. "^" .. (p.rank or 0) .. ":" .. (p.max or 0) .. ":" .. (p.count or 0)
-    .. "^" .. owner .. "^" .. (pl.seen or time()), dist, true)
+  self:Send("S^L^" .. prof .. "^" .. p.hash .. "^" .. getn(chunks) .. "^" .. meta .. "^" .. owner .. "^" .. seen, dist, true)
   for i = 1, getn(chunks) do self:Send("C^" .. chunks[i] .. ".", dist, true) end
-  self:Send("E^R^" .. prof .. "^" .. p.hash, dist, true, function() RS.served[key] = GetTime() end)
+  self:Send("E^L^" .. prof .. "^" .. p.hash, dist, true, function() RS.served[key] = GetTime() end)
 end
 
-function RS:ScheduleAutoFetch(owner, prof)
-  self:After("af/" .. owner .. "/" .. prof, 3 + math.random() * 12, function()
-    local p = RS:GetProf(owner, prof)
-    if not p or p.hash == p.latest then return end
-    local now, n = GetTime(), 0
-    for i = getn(RS.autoLog), 1, -1 do
-      if now - RS.autoLog[i] > 300 then tremove(RS.autoLog, i) else n = n + 1 end
+-- someone asked for owner's list: answer if it's ours; if the owner is offline, one holder passes it on
+function RS:AnswerRequest(owner, prof, dist)
+  if not self:ValidName(owner) or not prof or prof == "" or strlen(prof) > 30 then return end
+  self.requested[owner .. "/" .. prof] = GetTime()
+  if owner == self:MyName() then
+    self:ServeList(owner, prof, dist)
+  elseif not self:IsOnline(owner) and self:Fresh(owner) then
+    local p = self:GetProf(owner, prof)
+    if p and p.data and (not p.latest or p.latest == p.hash) then
+      local key = owner .. "/" .. prof .. "/" .. dist
+      self:After("relay/" .. key, 1.5 + math.random() * 6, function()
+        local s = RS.seenXfer[key]
+        if s and GetTime() - s < 30 then return end
+        RS:ServeList(owner, prof, dist)
+      end)
     end
-    if n >= RS.LIMIT.autoRequests then return end
-    if RS:RequestProf(owner, prof) then tinsert(RS.autoLog, now) end
-  end)
+  end
 end
 
-function RS:DumpManual(dist)
-  local key = "mdump/" .. dist
+-------------------------------------------------------------------------------
+-- Bulk transfers (names list "N", directory "G", big lists "L")
+-------------------------------------------------------------------------------
+function RS:SendBulk(kind, data, dist, count)
+  if getn(self.bulkQ) > self.LIMIT.bulkQueue then return false end
+  local chunks = self:Chunk(data, self.CHUNK)
+  if getn(chunks) > self.LIMIT.chunksPerXfer then return false end
+  local digest = (kind == "N") and self:ManualDigest() or self:DirDigest()
+  self:Send("S^" .. kind .. "^*^" .. digest .. "^" .. getn(chunks) .. "^" .. (count or 0), dist, true)
+  for i = 1, getn(chunks) do self:Send("C^" .. chunks[i] .. ".", dist, true) end
+  self:Send("E^" .. kind .. "^*^" .. digest, dist, true)
+  return true
+end
+
+function RS:SendNames(dist)
+  if not self:CanEditNames() then return end
+  local key = "N/" .. dist
   local last = self.lastDump[key]
-  if last and GetTime() - last < 120 then return end
-  if getn(self.bulkQ) > self.LIMIT.bulkQueue then return end
+  if last and GetTime() - last < 300 then return end
   local recs = {}
   for _, m in pairs(self.manual) do
     tinsert(recs, m.c .. "," .. m.p .. "," .. m.s .. "," .. m.t .. "," .. (m.d and 1 or 0) .. "," .. m.b)
   end
   if getn(recs) == 0 then return end
   tsort(recs)
-  local digest = self:ManualDigest()
-  local chunks = self:Chunk(tconcat(recs, ";"), self.CHUNK)
-  if getn(chunks) > self.LIMIT.chunksPerXfer then return end
-  self.lastDump[key] = GetTime()
-  self:Send("S^M^*^" .. digest .. "^" .. getn(chunks) .. "^" .. getn(recs), dist, true)
-  for i = 1, getn(chunks) do self:Send("C^" .. chunks[i] .. ".", dist, true) end
-  self:Send("E^M^*^" .. digest, dist, true)
+  if self:SendBulk("N", tconcat(recs, ";"), dist, getn(recs)) then self.lastDump[key] = GetTime() end
 end
 
--- counter = we just merged someone's list and still have entries they lack
-function RS:ScheduleManualDump(dist, counter)
-  local seen = self.lastDump["seenM/" .. dist]
-  if not counter and seen and GetTime() - seen < 60 then return end
-  if self:ManualCount() == 0 then return end
-  self:After("mdump/" .. dist, (counter and 8 or 4) + math.random() * 16, function()
-    local s = RS.lastDump["seenM/" .. dist]
-    if not counter and s and GetTime() - s < 60 then return end
-    RS:DumpManual(dist)
+-- counter = we just merged an officer's list and still have entries they lack
+function RS:ScheduleNames(dist, counter)
+  if not self:CanEditNames() or self:ManualCount() == 0 then return end
+  local seen = self.lastDump["seenN/" .. dist]
+  if not counter and seen and GetTime() - seen < 120 then return end
+  self:After("names/" .. dist, (counter and 8 or 4) + math.random() * 16, function()
+    local s = RS.lastDump["seenN/" .. dist]
+    if not counter and s and GetTime() - s < 120 then return end
+    RS:SendNames(dist)
   end)
 end
 
+function RS:RequestDirectory(dist)
+  if dist then self:Send("D^" .. self.PROTO .. "^" .. self:DirDigest(), dist) end
+end
+
+function RS:SendDirectory(dist)
+  local key = "G/" .. dist
+  local last = self.lastDump[key]
+  if last and GetTime() - last < 120 then return end
+  local entries = self:DirEntries()
+  if getn(entries) == 0 then return end
+  if self:SendBulk("G", tconcat(entries, ";"), dist, getn(entries)) then self.lastDump[key] = GetTime() end
+end
+
+-- one player answers a directory request; everyone else stands down when they see it
 function RS:ScheduleDirectory(dist)
-  local seen = self.lastDump["seenD/" .. dist]
+  local seen = self.lastDump["seenG/" .. dist]
   if seen and GetTime() - seen < 60 then return end
   self:After("dir/" .. dist, 2 + math.random() * 10, function()
-    local s = RS.lastDump["seenD/" .. dist]
-    if s and GetTime() - s < 60 then return end -- someone already answered
+    local s = RS.lastDump["seenG/" .. dist]
+    if s and GetTime() - s < 60 then return end
     RS:SendDirectory(dist)
   end)
 end
 
+-------------------------------------------------------------------------------
+-- Receiving
+-------------------------------------------------------------------------------
 function RS:RateOK(sender)
   local now = GetTime()
   local m = self.muted[sender]
@@ -1101,26 +1326,23 @@ function RS:OnComm(prefix, msg, dist, sender)
   if not self.players or sender == self:MyName() or not DISTS[dist] then return end
   if strlen(msg) > 250 or strlen(msg) < 2 or strsub(msg, 2, 2) ~= "^" then return end
   if not self:RateOK(sender) then return end
+  if dist == "CHANNEL" and IsInGuild() and not self.rosterRank[sender] then self.outsiders[sender] = GetTime() end
   self:Safe(self.HandleMessage, self, strsub(msg, 1, 1), strsub(msg, 3), dist, sender)
 end
 
 function RS:HandleMessage(t, body, dist, sender)
   local now = GetTime()
-  self.live[sender] = now
 
-  if t == "H" then
-    local f = Split(body, "^")
-    if f[1] ~= self.PROTO then self:CheckVersion(f[2]); return end
-    local pl = self:GetPlayer(sender, true)
-    pl.dist = dist
-    self:Seen(sender)
-    if self.CLASS_COLORS[f[3] or ""] then pl.class = f[3] end
-    self:After("reply/" .. dist, 1 + math.random() * 5, function() RS:Send(RS:BuildIndex(), dist) end)
+  -- every protocol so far starts hellos/indexes with "<proto>^<version>": use that for update notices
+  if t == "H" or t == "I" then
+    local f = Split(body, "^", 3)
+    self:NoteVersion(f[1], f[2])
+  end
 
-  elseif t == "I" then
+  if t == "I" then
     local f = Split(body, "^")
-    if f[1] ~= self.PROTO then self:CheckVersion(f[2]); return end
-    self:CheckVersion(f[2])
+    if f[1] ~= self.PROTO then return end -- older or newer protocol: ignored entirely
+    self.live[sender] = now
     local pl = self:GetPlayer(sender, true)
     pl.dist = dist
     self:Seen(sender)
@@ -1138,7 +1360,7 @@ function RS:HandleMessage(t, body, dist, sender)
           local p = pl.profs[prof]
           if not p then p = {}; pl.profs[prof] = p end
           p.rank, p.max, p.count, p.latest, p.metaSeen = tonumber(x[2]), tonumber(x[3]), tonumber(x[4]), hash, time()
-          if p.hash ~= p.latest and self.db.settings.autoFetch then self:ScheduleAutoFetch(sender, prof) end
+          if p.hash ~= p.latest and self.db.settings.autoFetch then self:WantList(sender, prof, true) end
         end
       end
     end
@@ -1148,65 +1370,69 @@ function RS:HandleMessage(t, body, dist, sender)
       end
     end
     local md = Split(f[5] or "", ":")
-    if md[2] and md[2] ~= self:ManualDigest() then self:ScheduleManualDump(dist) end
+    if md[2] and md[2] ~= self:ManualDigest() then self:ScheduleNames(dist) end
+    -- a hello whose directory differs from ours gets one directory answer (from one player)
+    if f[7] == "1" and f[6] and f[6] ~= self:DirDigest() then self:ScheduleDirectory(dist) end
     self:Changed()
 
   elseif t == "D" then
-    -- someone asks for the directory; answer only if ours differs (one answer per minute per channel)
-    if body ~= self:DirDigest() then self:ScheduleDirectory(dist) end
+    local f = Split(body, "^")
+    if f[1] ~= self.PROTO then return end
+    if f[2] ~= self:DirDigest() then self:ScheduleDirectory(dist) end
 
   elseif t == "Q" then
     local f = Split(body, "^")
-    local target, prof = f[1], f[2]
-    if not target or not prof or not self:ValidName(target) then return end
-    self.requested[target .. "/" .. prof] = now
-    if target == self:MyName() then
-      self:ServeList(target, prof, dist)
-    elseif not self:IsOnline(target) and self:Fresh(target) then
-      -- crafter is offline: one of the people holding a copy passes it along
-      local p = self:GetProf(target, prof)
-      if p and p.data and (not p.latest or p.latest == p.hash) then
-        self:After("relay/" .. target .. "/" .. prof .. "/" .. dist, 1.5 + math.random() * 5, function()
-          local s = RS.seenXfer[target .. "/" .. prof .. "/" .. dist]
-          if s and GetTime() - s < 30 then return end
-          RS:ServeList(target, prof, dist)
-        end)
-      end
+    if f[1] ~= self.PROTO or not f[2] then return end
+    local list = Split(f[2], ",")
+    for i = 1, getn(list) do
+      if i > self.LIMIT.reqPerMsg then break end
+      local x = Split(list[i], ":")
+      self:AnswerRequest(x[1], x[2], dist)
     end
+
+  elseif t == "L" then
+    local f = Split(body, "^", 6)
+    if f[1] ~= self.PROTO or not f[6] then return end
+    local m = Split(f[4] or "", ":")
+    self:ReceiveList({ owner = f[2], key = f[3], rank = tonumber(m[1]), max = tonumber(m[2]), count = tonumber(m[3]),
+      seen = tonumber(f[5]), sender = sender, dist = dist }, f[6])
 
   elseif t == "M" then
     local f = Split(body, "^")
+    if f[1] ~= self.PROTO then return end
+    -- only the officer who made the change may send it, and only if our roster says they're top-3 rank
+    if f[7] ~= sender or not self:IsOfficer(sender) then return end
     local r = self.manualRate[sender]
     if not r or now - r.t > 60 then r = { t = now, n = 0 }; self.manualRate[sender] = r end
     r.n = r.n + 1
     if r.n > self.LIMIT.manualPerMin then return end
-    local spell = ParseId(f[3])
-    if spell and self:MergeManual(f[1], f[2], spell, f[4], f[5] == "1", f[6]) then self:Changed() end
+    local spell = ParseId(f[4])
+    if spell and self:MergeManual(f[2], f[3], spell, f[5], f[6] == "1", f[7]) then self:Changed() end
 
   elseif t == "S" then
     local f = Split(body, "^")
     local kind, key, hash, n = f[1], f[2], f[3], tonumber(f[4])
-    if (kind ~= "R" and kind ~= "M" and kind ~= "D") or not key or not hash or strlen(hash) > 10
-       or not n or n < 0 or n > self.LIMIT.chunksPerXfer then return end
+    if (kind ~= "L" and kind ~= "N" and kind ~= "G") or not key or not hash or strlen(hash) > 10
+       or not n or n < 1 or n > self.LIMIT.chunksPerXfer then return end
+    if kind == "N" and not self:IsOfficer(sender) then return end
     local count = 0
     for _ in pairs(self.inbound) do count = count + 1 end
     local ikey = sender .. "/" .. dist
     if count >= self.LIMIT.inbound and not self.inbound[ikey] then return end
-    local tr = { kind = kind, key = key, hash = hash, n = n, parts = {}, sender = sender, last = now }
-    if kind == "R" then
+    local tr = { kind = kind, key = key, hash = hash, n = n, parts = {}, sender = sender, last = now, dist = dist }
+    if kind == "L" then
       local m = Split(f[5] or "", ":")
       tr.rank, tr.max, tr.count = tonumber(m[1]), tonumber(m[2]), tonumber(m[3])
-      tr.owner = f[6] or sender
+      tr.owner, tr.seen = f[6], tonumber(f[7])
       if not self:ValidName(tr.owner) then return end
-      tr.seen = tonumber(f[7])
       self.requested[tr.owner .. "/" .. key] = now
       self.seenXfer[tr.owner .. "/" .. key .. "/" .. dist] = now
       self:Cancel("relay/" .. tr.owner .. "/" .. key .. "/" .. dist)
-    elseif kind == "M" then
-      self.lastDump["seenM/" .. dist] = now
-      self:Cancel("mdump/" .. dist)
+    elseif kind == "N" then
+      self.lastDump["seenN/" .. dist] = now
+      self:Cancel("names/" .. dist)
     else
-      self.lastDump["seenD/" .. dist] = now
+      self.lastDump["seenG/" .. dist] = now
       self:Cancel("dir/" .. dist)
     end
     self.inbound[ikey] = tr
@@ -1228,9 +1454,9 @@ function RS:HandleMessage(t, body, dist, sender)
     local f = Split(body, "^")
     if not tr or tr.kind ~= f[1] or tr.key ~= f[2] or tr.hash ~= f[3] or getn(tr.parts) ~= tr.n then return end
     local data = tconcat(tr.parts)
-    if tr.kind == "R" then
-      self:ReceiveList(tr, data)
-    elseif tr.kind == "M" then
+    if tr.kind == "L" then
+      if self:Hash(data) == tr.hash then self:ReceiveList(tr, data) end
+    elseif tr.kind == "N" then
       local recs = Split(data, ";")
       local changed = false
       for i = 1, getn(recs) do
@@ -1240,7 +1466,7 @@ function RS:HandleMessage(t, body, dist, sender)
         if spell and self:MergeManual(x[1], x[2], spell, x[4], x[5] == "1", x[6]) then changed = true end
       end
       if changed then self:Changed() end
-      if self:ManualDigest() ~= tr.hash then self:ScheduleManualDump(dist, true) end
+      if self:ManualDigest() ~= tr.hash then self:ScheduleNames(dist, true) end
     else
       self:MergeDirectory(data, dist)
     end
@@ -1248,29 +1474,34 @@ function RS:HandleMessage(t, body, dist, sender)
   end
 end
 
+-- tr: owner, key (profession), rank/max/count, seen, sender, dist
 function RS:ReceiveList(tr, data)
-  local owner = tr.owner
-  self.requested[owner .. "/" .. tr.key] = nil
+  local owner, prof = tr.owner, tr.key
+  if not self:ValidName(owner) or not prof or prof == "" or strlen(prof) > 30 then return end
+  self.requested[owner .. "/" .. prof] = nil
+  self.seenXfer[owner .. "/" .. prof .. "/" .. tr.dist] = GetTime()
+  self:Cancel("relay/" .. owner .. "/" .. prof .. "/" .. tr.dist)
   if owner == self:MyName() then return end -- nobody else gets to tell us what we know
-  if self:Hash(data) ~= tr.hash or not self:ParseKnown(data, tr.hash) then return end
+  local hash = self:Hash(data)
+  if not self:ParseKnown(data, hash, prof) then return end
   local relayed = owner ~= tr.sender
   local seen = relayed and tr.seen and tr.seen <= time() + 3600 and tr.seen or time()
   if relayed and time() - seen >= self.STALE then return end
   local pl = self:GetPlayer(owner, seen)
-  local p = pl.profs[tr.key]
+  local p = pl.profs[prof]
   -- a passed-along copy is only accepted if it matches what the owner last announced
-  if relayed and p and p.latest and p.latest ~= tr.hash then return end
-  if not p then p = {}; pl.profs[tr.key] = p end
-  p.data, p.hash = data, tr.hash
-  if not p.latest or not relayed then p.latest = tr.hash end
-  p.rank, p.max, p.count, p.updated = tr.rank, tr.max, tr.count, time()
-  if relayed then
-    if tr.seen then self:Seen(owner, tr.seen) end
-  else
-    self:Seen(owner)
+  if relayed and p and p.latest and p.latest ~= hash then return end
+  if not p then p = {}; pl.profs[prof] = p end
+  if p.hash == hash and p.data then
+    if not relayed then self:Seen(owner) end
+    return
   end
+  p.data, p.hash = data, hash
+  if not p.latest or not relayed then p.latest = hash end
+  p.rank, p.max, p.count, p.updated = tr.rank, tr.max, tr.count, time()
+  if relayed then self:Seen(owner, seen) else self:Seen(owner); self.live[owner] = GetTime() end
   self:Changed()
-  if self.View and self.View.OnDataReceived then self.View:OnDataReceived(owner, tr.key) end
+  if self.View and self.View.OnDataReceived then self.View:OnDataReceived(owner, prof) end
 end
 
 function RS:SweepInbound()
@@ -1288,7 +1519,7 @@ end
 
 function RS:Progress(owner, prof)
   for _, tr in pairs(self.inbound) do
-    if tr.kind == "R" and tr.owner == owner and tr.key == prof then return getn(tr.parts), tr.n end
+    if tr.kind == "L" and tr.owner == owner and tr.key == prof then return getn(tr.parts), tr.n end
   end
 end
 
@@ -1303,13 +1534,15 @@ end
 -------------------------------------------------------------------------------
 function RS:UpdateRoster()
   self.online = {}
+  self.rosterRank = {}
   if not IsInGuild() then return end
   local n = GetNumGuildMembers(true) or 0
   if n > 1000 then n = 1000 end
   local now = time()
   for i = 1, n do
-    local name, _, _, _, class, _, _, _, online = GetGuildRosterInfo(i)
+    local name, _, rankIndex, _, class, _, _, _, online = GetGuildRosterInfo(i)
     if name then
+      if type(rankIndex) == "number" then self.rosterRank[name] = rankIndex end
       local tok = ClassToken(class)
       if tok then self.rosterClass[name] = tok end
       if online then
@@ -1371,12 +1604,9 @@ function RS:OnEvent(event, a1, a2, a3, a4, a9)
   elseif event == "PLAYER_ENTERING_WORLD" then
     if not self.loggedIn then
       self.loggedIn = true
-      self:Print("loaded. Type |cffffff00/recipes|r to see your guild's professions.")
+      self:Print("loaded. Type |cffffff00/recipes|r or click the minimap button.")
       if IsInGuild() then GuildRoster() end
-      self:After("login", 8, function()
-        RS:Announce()
-        if IsInGuild() then RS:RequestDirectory("GUILD") end
-      end)
+      self:After("login", 10, function() RS:Announce() end)
       self:After("channel", 6, function() RS:UpdateChannel() end)
       self:After("prune", 20, function() RS:PruneOwn(); RS:PruneStale() end)
     end
@@ -1413,9 +1643,9 @@ function RS:OnEvent(event, a1, a2, a3, a4, a9)
     if grew then
       self:After("group", 8, function()
         local d = RS:GroupDist()
-        if d and (not RS.lastGroupAnnounce or GetTime() - RS.lastGroupAnnounce > 60) then
+        if d and (not RS.lastGroupAnnounce or GetTime() - RS.lastGroupAnnounce > 120) then
           RS.lastGroupAnnounce = GetTime()
-          RS:Announce(d)
+          RS:SendIndex(d, false)
         end
       end)
     end
